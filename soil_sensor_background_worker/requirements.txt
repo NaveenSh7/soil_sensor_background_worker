@@ -1,5 +1,5 @@
 fastapi==0.111.0
-uvicorn==0.23.3
+uvicorn
 firebase-admin==6.5.0
 pandas==2.3.0
 scikit-learn==1.6.1
