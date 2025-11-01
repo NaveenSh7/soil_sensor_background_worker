@@ -19,7 +19,7 @@ import json
 # ============================================================================
 
 # Firebase collections
-RAW_COLLECTION = os.getenv("RAW_COLLECTION", "npk_readings_sensor_2")
+RAW_COLLECTION = os.getenv("RAW_COLLECTION", "npk_readings")
 CALIBRATED_COLLECTION = os.getenv("CALIBRATED_COLLECTION", "calibrated_npk_readings_sensor_2")
 
 # Path to your trained model file
