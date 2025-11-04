@@ -20,7 +20,7 @@ import json
 
 # Firebase collections
 RAW_COLLECTION = os.getenv("RAW_COLLECTION", "npk_readings")
-CALIBRATED_COLLECTION = os.getenv("CALIBRATED_COLLECTION", "calibrated_npk_readings_sensor_2")
+CALIBRATED_COLLECTION = os.getenv("CALIBRATED_COLLECTION", "calibrated_npk_readings_sensor_1")
 
 # Path to your trained model file
 MODEL_PATH = "soil_calibration_model.pkl"
