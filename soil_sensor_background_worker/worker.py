@@ -162,11 +162,12 @@ def process_document(doc_id: str, data: dict,
 # REAL-TIME LISTENER
 # ============================================================================
 
-def start_listener_for_collections(RAW_COLLECTION, CALIBRATED_COLLECTION):
+def start_listener_for_collections(RAW_COLLECTION, CALIBRATED_COLLECTION, stop_event):
     """Start listener for a specific collection pair"""
     last_processed_doc_id = None
     initial_snapshot_received = False
     processing_lock = threading.Lock()
+    doc_watch = None
 
     def get_latest_document():
         """Get the most recent document from the raw collection"""
@@ -220,15 +221,39 @@ def start_listener_for_collections(RAW_COLLECTION, CALIBRATED_COLLECTION):
                 last_processed_doc_id = latest_doc.id
 
     print(f"👀 Starting listener for {RAW_COLLECTION} → {CALIBRATED_COLLECTION}")
-    db.collection(RAW_COLLECTION).on_snapshot(on_snapshot)
+    doc_watch = db.collection(RAW_COLLECTION).on_snapshot(on_snapshot)
+    
+    # Keep the listener alive until stop_event is set
+    while not stop_event.is_set():
+        time.sleep(1)
+    
+    # Unsubscribe when stopping
+    if doc_watch:
+        doc_watch.unsubscribe()
+        print(f"🛑 Stopped listener for {RAW_COLLECTION}")
 
 
 # ============================================================================
-# MAIN ENTRY POINT
+# WORKER THREAD MANAGEMENT
 # ============================================================================
+
+# Global state for worker threads
+worker_threads = []
+stop_event = threading.Event()
+worker_running = False
 
 def start_worker():
     """Start background workers for all sensor collections"""
+    global worker_threads, stop_event, worker_running
+    
+    if worker_running:
+        print("⚠️  Worker already running")
+        return "Worker already running"
+    
+    # Reset stop event
+    stop_event.clear()
+    worker_running = True
+    
     print("="*70)
     print("🚀 NPK Calibration Service Started")
     print("="*70)
@@ -237,32 +262,64 @@ def start_worker():
     print("="*70)
     
     # Start listener for Sensor 1
-    threading.Thread(
+    thread1 = threading.Thread(
         target=start_listener_for_collections,
-        args=("npk_readings", "calibrated_npk_readings_sensor_1"),
+        args=("npk_readings", "calibrated_npk_readings_sensor_1", stop_event),
         daemon=True
-    ).start()
+    )
+    thread1.start()
+    worker_threads.append(thread1)
 
     # Start listener for Sensor 2
-    threading.Thread(
+    thread2 = threading.Thread(
         target=start_listener_for_collections,
-        args=("npk_readings_sensor_2", "calibrated_npk_readings_sensor_2"),
+        args=("npk_readings_sensor_2", "calibrated_npk_readings_sensor_2", stop_event),
         daemon=True
-    ).start()
+    )
+    thread2.start()
+    worker_threads.append(thread2)
 
     print("\n✅ All listeners started successfully")
     print("✅ Monitoring both sensor collections")
     print("="*70)
-    print("\n⏳ Service running... Press Ctrl+C to stop\n")
+    
+    return "Worker started successfully"
 
+
+def stop_worker():
+    """Stop the background worker gracefully"""
+    global worker_threads, stop_event, worker_running
+    
+    if not worker_running:
+        print("⚠️  Worker not running")
+        return "Worker not running"
+    
+    print("\n🛑 Stopping workers...")
+    stop_event.set()
+    
+    # Wait for all threads to finish (with timeout)
+    for thread in worker_threads:
+        thread.join(timeout=5)
+    
+    worker_threads.clear()
+    worker_running = False
+    
+    print("✅ All workers stopped")
+    return "Worker stopped successfully"
+
+
+# ============================================================================
+# STANDALONE ENTRY POINT (for direct execution)
+# ============================================================================
+
+if __name__ == "__main__":
+    start_worker()
+    
     try:
         # Keep the script running
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n\n🛑 Stopping service...")
+        print("\n\n🛑 Keyboard interrupt received...")
+        stop_worker()
         print("✅ Service stopped. Exiting...")
-
-
-if __name__ == "__main__":
-    start_worker()
