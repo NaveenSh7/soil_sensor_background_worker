@@ -1,19 +1,17 @@
 """
 Firebase Real-time NPK Sensor Data Calibration Script
 
-Listens to new documents in npk_readings collection and processes them
-through the calibration model, then stores results in calibrated_npk_readings
-
-FIX APPLIED:
-- Listener now uses `changes` list with `change.type.name == "ADDED"` filter
-  instead of fetching the "latest" document on every snapshot trigger.
-  This prevents re-processing when old docs are updated (e.g. processed=True flag).
+FIXES APPLIED:
+1. Listener now filters to only UNPROCESSED docs using .where("processed", "!=", True)
+   — avoids loading thousands of old documents on startup
+2. Removed per-doc baseline logging that caused slowdowns on large collections
+3. Added catch-up function to process missed docs on cold start
+4. Listener only fires on ADDED changes, ignores MODIFIED/REMOVED
 """
 
 import firebase_admin
 from firebase_admin import credentials, firestore
 import pandas as pd
-import datetime
 import threading
 import time
 import joblib
@@ -74,7 +72,7 @@ def load_model():
 model = load_model()
 
 # ============================================================================
-# DATA PROCESSING FUNCTIONS
+# DATA PROCESSING
 # ============================================================================
 
 def prepare_input(data: dict) -> pd.DataFrame:
@@ -84,14 +82,13 @@ def prepare_input(data: dict) -> pd.DataFrame:
         if key not in data:
             raise KeyError(f"Missing field: {key}")
 
-    df = pd.DataFrame([[
+    return pd.DataFrame([[
         data["N"],
         data["P"],
         data["K"],
         data["pH"],
         data["Conductivity"]
     ]], columns=["sensor_N", "sensor_P", "sensor_K", "sensor_PH", "sensor_EC"])
-    return df
 
 
 def process_document(doc_id: str, data: dict, raw_collection: str, calibrated_collection: str) -> bool:
@@ -102,7 +99,7 @@ def process_document(doc_id: str, data: dict, raw_collection: str, calibrated_co
         # Guard: skip if already calibrated
         calibrated_ref = db.collection(calibrated_collection).document(doc_id)
         if calibrated_ref.get().exists:
-            print(f"⏭️  Doc {doc_id} already exists in calibrated collection, skipping...")
+            print(f"⏭️  Doc {doc_id} already calibrated, skipping...")
             return False
 
         # Prepare input & predict
@@ -119,16 +116,15 @@ def process_document(doc_id: str, data: dict, raw_collection: str, calibrated_co
         }
 
         # Merge with original data and save
-        merged = {**data, **calibrated_dict}
-        calibrated_ref.set(merged)
+        calibrated_ref.set({**data, **calibrated_dict})
 
-        # Mark the original document as processed
+        # Mark original doc as processed
         db.collection(raw_collection).document(doc_id).update({
             "processed":    True,
             "processed_at": firestore.SERVER_TIMESTAMP,
         })
 
-        print(f"✅ Calibrated and saved doc {doc_id}")
+        print(f"✅ Calibrated and saved: {doc_id}")
         print(f"   Collection : {calibrated_collection}")
         print(f"   Sensor ID  : {data.get('sensorId', 'N/A')}")
         print(f"   Timestamp  : {data.get('timestamp', 'N/A')}")
@@ -141,7 +137,7 @@ def process_document(doc_id: str, data: dict, raw_collection: str, calibrated_co
         return True
 
     except KeyError as e:
-        print(f"❌ Missing field in document {doc_id}: {e}")
+        print(f"❌ Missing field in {doc_id}: {e}")
         return False
     except Exception as e:
         print(f"❌ Error processing {doc_id}: {e}")
@@ -150,48 +146,81 @@ def process_document(doc_id: str, data: dict, raw_collection: str, calibrated_co
         return False
 
 # ============================================================================
-# REAL-TIME LISTENER  (THE CRITICAL FIX IS HERE)
+# CATCH-UP: process missed docs from cold start / downtime
+# ============================================================================
+
+def process_missed_documents(raw_collection: str, calibrated_collection: str):
+    """
+    On startup, find and process any documents that arrived while
+    the service was down (cold start gap).
+    Looks for docs where processed != True.
+    """
+    print(f"\n🔍 [{raw_collection}] Checking for missed documents...")
+
+    try:
+        docs = list(
+            db.collection(raw_collection)
+            .where("processed", "!=", True)
+            .stream()
+        )
+
+        if not docs:
+            print(f"✅ [{raw_collection}] No missed documents found")
+            return
+
+        print(f"⚠️  [{raw_collection}] Found {len(docs)} missed document(s) — processing now...")
+
+        success_count = 0
+        for doc in docs:
+            success = process_document(
+                doc.id, doc.to_dict(), raw_collection, calibrated_collection
+            )
+            if success:
+                success_count += 1
+
+        print(f"✅ [{raw_collection}] Catch-up complete: {success_count}/{len(docs)} processed")
+
+    except Exception as e:
+        print(f"❌ [{raw_collection}] Catch-up error: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ============================================================================
+# REAL-TIME LISTENER
 # ============================================================================
 
 def start_listener_for_collections(raw_collection: str, calibrated_collection: str, stop_event: threading.Event):
     """
     Start a Firestore listener for a specific collection pair.
 
-    KEY FIX:
-      Previously, on_snapshot fetched the "latest" document on every trigger,
-      meaning updates to old documents (e.g. setting processed=True) would
-      re-fire the callback and risk infinite loops / duplicate processing.
-
-      Now we iterate over `changes` and only process documents whose
-      change type is "ADDED" — i.e. genuinely new documents written to the
-      collection. MODIFIED and REMOVED changes are ignored entirely.
+    KEY FIXES:
+    1. Queries only unprocessed docs (.where processed != True)
+       so initial snapshot is small, not the entire collection history
+    2. Only processes ADDED change types — ignores MODIFIED (processed=True update)
+       and REMOVED to prevent infinite loops
+    3. Catch-up runs first to handle cold-start missed documents
     """
 
+    # ── Step 1: Process anything missed while service was down ──────────
+    process_missed_documents(raw_collection, calibrated_collection)
+
+    # ── Step 2: Start live listener for new documents ────────────────────
     initial_snapshot_received = False
-    doc_watch = None
 
     def on_snapshot(doc_snapshot, changes, read_time):
         nonlocal initial_snapshot_received
 
-        # ── Skip the very first snapshot (contains existing docs, not new ones) ──
+        # Skip initial snapshot — catch-up already handled missed docs
         if not initial_snapshot_received:
             initial_snapshot_received = True
-            print(f"📦 [{raw_collection}] Initial snapshot received — skipping existing docs")
-
-            # Log baseline info for transparency
-            for doc in doc_snapshot:
-                data = doc.to_dict()
-                print(f"   Baseline doc: {doc.id} | "
-                      f"Timestamp: {data.get('timestamp', 'N/A')} | "
-                      f"Sensor: {data.get('sensorId', 'N/A')}")
+            print(f"📦 [{raw_collection}] Listener active — watching for new documents")
             return
 
-        # ── THE FIX: only act on genuinely NEW documents ──────────────────────
+        # Only process genuinely NEW documents
         for change in changes:
-            # change.type is a DocumentChange enum: ADDED, MODIFIED, REMOVED
             if change.type.name != "ADDED":
-                # MODIFIED fires when we update processed=True — ignore it
-                # REMOVED fires on deletes — ignore it
+                # MODIFIED  → fires when we set processed=True, ignore
+                # REMOVED   → fires on deletes, ignore
                 continue
 
             doc  = change.document
@@ -200,10 +229,16 @@ def start_listener_for_collections(raw_collection: str, calibrated_collection: s
             print(f"\n📨 [{raw_collection}] New document detected: {doc.id}")
             process_document(doc.id, data, raw_collection, calibrated_collection)
 
-    print(f"👀 Starting listener: {raw_collection} → {calibrated_collection}")
-    doc_watch = db.collection(raw_collection).on_snapshot(on_snapshot)
+    print(f"👀 [{raw_collection}] Starting live listener → {calibrated_collection}")
 
-    # Keep the thread alive until the stop_event is set
+    # FIX: Only listen to unprocessed docs — avoids loading full collection history
+    doc_watch = (
+        db.collection(raw_collection)
+        .where("processed", "!=", True)
+        .on_snapshot(on_snapshot)
+    )
+
+    # Keep thread alive
     while not stop_event.is_set():
         time.sleep(1)
 
@@ -217,7 +252,7 @@ def start_listener_for_collections(raw_collection: str, calibrated_collection: s
 # ============================================================================
 
 worker_threads: list[threading.Thread] = []
-stop_event    = threading.Event()
+stop_event     = threading.Event()
 worker_running = False
 
 
@@ -235,7 +270,7 @@ def start_worker() -> str:
     print("=" * 70)
     print("🚀 NPK Calibration Service Started")
     print("=" * 70)
-    print(f"🤖 Model: {MODEL_PATH}")
+    print(f"🤖 Model     : {MODEL_PATH}")
     print(f"🌍 Environment: {'PRODUCTION (Render)' if os.getenv('RENDER') else 'LOCAL'}")
     print("=" * 70)
 
@@ -260,7 +295,7 @@ def start_worker() -> str:
     worker_threads.append(thread2)
 
     print("\n✅ All listeners started successfully")
-    print("✅ Monitoring both sensor collections")
+    print("✅ Monitoring: npk_readings + npk_readings_sensor_2")
     print("=" * 70)
     return "Worker started successfully"
 
